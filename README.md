@@ -38,7 +38,17 @@ signal-cli --version
 
 ### 2. Python 3.10+
 
-Ensure you have Python 3.10 or later installed.
+**macOS (Homebrew):**
+```bash
+brew install python@3.11
+```
+
+**Or using pyenv:**
+```bash
+brew install pyenv
+pyenv install 3.11
+pyenv global 3.11
+```
 
 ## Installation
 
