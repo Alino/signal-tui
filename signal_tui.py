@@ -15,6 +15,7 @@ from textual.binding import Binding
 from textual.reactive import reactive
 from textual.screen import Screen
 from textual.worker import Worker, get_current_worker
+from textual.message import Message as TextualMessage
 from rich.text import Text
 from rich.panel import Panel
 from rich.console import RenderableType
@@ -22,6 +23,7 @@ from rich.align import Align
 
 from config import config_manager, Config, contact_cache
 from signal_client import SignalClient, AsyncSignalClient, Message, Contact, SignalCliNotFoundError
+from clipboard import grab_clipboard_image, cleanup_temp_attachment, is_clipboard_supported, StagedAttachment
 
 # QR Code generation
 try:
@@ -76,15 +78,41 @@ def generate_qr_code(data: str) -> str:
 # Message Components
 # ============================================================================
 
+class MessageInput(Input):
+    """Custom input that handles Ctrl+V for image paste."""
+
+    class ImagePasted(TextualMessage):
+        """Message sent when an image is pasted."""
+        def __init__(self, attachment: StagedAttachment) -> None:
+            super().__init__()
+            self.attachment = attachment
+
+    def _on_key(self, event) -> None:
+        """Intercept Ctrl+V to check for clipboard images."""
+        if event.key == "ctrl+v":
+            # Check if there's an image in the clipboard
+            if is_clipboard_supported():
+                attachment = grab_clipboard_image()
+                if attachment:
+                    # Post a custom message to the app
+                    self.post_message(self.ImagePasted(attachment))
+                    event.prevent_default()
+                    event.stop()
+                    return
+        # Let parent handle other keys
+        super()._on_key(event)
+
+
 class MessageBubble(Static):
     """A single message bubble."""
 
-    def __init__(self, sender: str, message: str, time: str, is_me: bool = False) -> None:
+    def __init__(self, sender: str, message: str, time: str, is_me: bool = False, attachments: list = None) -> None:
         super().__init__()
         self.sender = sender
         self.message = message
         self.time = time
         self.is_me = is_me
+        self.attachments = attachments or []
 
     def compose(self) -> ComposeResult:
         yield Static(self._render_message())
@@ -101,7 +129,49 @@ class MessageBubble(Static):
         header.append(f"  {self.time}", style="dim italic #9ca3af")
 
         content = Text()
-        content.append(self.message, style="#f0f0f5")
+
+        # Show attachments first
+        for att in self.attachments:
+            content_type = att.get("contentType", "")
+            filename = att.get("filename", "attachment")
+            size = att.get("size", 0)
+            width = att.get("width", 0)
+            height = att.get("height", 0)
+
+            # Size formatting
+            if size < 1024:
+                size_str = f"{size} B"
+            elif size < 1024 * 1024:
+                size_str = f"{size / 1024:.1f} KB"
+            else:
+                size_str = f"{size / (1024 * 1024):.1f} MB"
+
+            # Determine attachment type icon
+            if content_type.startswith("image/"):
+                icon = "🖼️"
+                type_name = "Image"
+            elif content_type.startswith("video/"):
+                icon = "🎬"
+                type_name = "Video"
+            elif content_type.startswith("audio/"):
+                icon = "🎵"
+                type_name = "Audio"
+            else:
+                icon = "📎"
+                type_name = "File"
+
+            content.append(f"{icon} {type_name}", style="bold #f59e0b")
+            if width and height:
+                content.append(f" ({width}x{height}, {size_str})", style="#9ca3af")
+            elif size:
+                content.append(f" ({size_str})", style="#9ca3af")
+            if filename:
+                content.append(f"\n   {filename}", style="italic #71717a")
+            content.append("\n")
+
+        # Then show message text
+        if self.message:
+            content.append(self.message, style="#f0f0f5")
 
         return Panel(
             content,
@@ -162,12 +232,16 @@ class StatusBar(Static):
     """Connection status bar."""
 
     connected = reactive(False)
+    connecting = reactive(True)  # Show "connecting..." state initially
     phone_number = reactive("")
-    version = reactive("")
+    version = reactive("...")
 
     def render(self) -> RenderableType:
         text = Text()
-        if self.connected:
+        if self.connecting:
+            text.append("◌ ", style="bold #f59e0b")
+            text.append("Connecting...", style="#f59e0b")
+        elif self.connected:
             text.append("● ", style="bold #22c55e")
             text.append("Connected", style="#22c55e")
         else:
@@ -178,6 +252,47 @@ class StatusBar(Static):
         if self.phone_number:
             text.append(" │ ", style="#3f3f46")
             text.append(f"Linked to: {self.phone_number}", style="#3b82f6")
+        return text
+
+
+class AttachmentIndicator(Static):
+    """Shows staged attachment info above the message input with preview."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._attachment: Optional[StagedAttachment] = None
+
+    def set_attachment(self, attachment: Optional[StagedAttachment]) -> None:
+        """Update the displayed attachment."""
+        self._attachment = attachment
+        if attachment:
+            self.add_class("visible")
+        else:
+            self.remove_class("visible")
+        self.refresh()
+
+    def render(self) -> RenderableType:
+        if not self._attachment:
+            return ""
+
+        text = Text()
+
+        # Header line with file info
+        text.append("📎 ", style="bold")
+        text.append(self._attachment.filename, style="bold #93c5fd")
+        text.append(f" ({self._attachment.size_human}", style="#9ca3af")
+        if self._attachment.dimensions:
+            text.append(f", {self._attachment.dimensions}", style="#9ca3af")
+        text.append(")", style="#9ca3af")
+        text.append("  │  ", style="#3f3f46")
+        text.append("Ctrl+X", style="bold #f59e0b")
+        text.append(" to remove", style="#9ca3af")
+
+        # Add preview if available
+        if self._attachment.preview:
+            text.append("\n")
+            text.append(self._attachment.preview, style="#a0a0a0")
+
         return text
 
 
@@ -603,7 +718,8 @@ class ChatMessages(ScrollableContainer):
                 msg.display_sender,
                 msg.body,
                 msg.timestamp.strftime("%I:%M %p"),
-                msg.is_outgoing
+                msg.is_outgoing,
+                msg.attachments
             )
             self.mount(bubble)
 
@@ -620,7 +736,8 @@ class ChatMessages(ScrollableContainer):
             msg.display_sender,
             msg.body,
             msg.timestamp.strftime("%I:%M %p"),
-            msg.is_outgoing
+            msg.is_outgoing,
+            msg.attachments
         )
         self.mount(bubble)
         self.scroll_end(animate=False)
@@ -795,6 +912,23 @@ class SignalTUI(App):
         padding: 2;
         text-style: italic;
     }
+
+    /* Attachment Indicator */
+    #attachment-indicator {
+        display: none;
+        height: auto;
+        max-height: 16;
+        padding: 1;
+        margin-bottom: 1;
+        background: rgb(32, 32, 40);
+        border: tall rgb(59, 130, 246);
+        border-title-color: rgb(59, 130, 246);
+        overflow-y: auto;
+    }
+
+    #attachment-indicator.visible {
+        display: block;
+    }
     """
 
     BINDINGS = [
@@ -803,6 +937,7 @@ class SignalTUI(App):
         Binding("ctrl+s", "search", "Search"),
         Binding("ctrl+r", "refresh", "Refresh"),
         Binding("ctrl+l", "setup", "Link Account"),
+        Binding("ctrl+x", "clear_attachment", "Clear", show=False),
         Binding("up", "prev_contact", "Prev", show=False),
         Binding("down", "next_contact", "Next", show=False),
         Binding("escape", "focus_input", "Focus Input", show=False),
@@ -824,8 +959,10 @@ class SignalTUI(App):
         self.async_client = AsyncSignalClient(self.signal_client)
         self.current_contact: Optional[str] = None
         self.current_contact_name: str = ""
+        self.current_is_group: bool = False
         self.conversations: dict[str, list[Message]] = {}
         self._receive_task: Optional[asyncio.Task] = None
+        self.staged_attachment: Optional[StagedAttachment] = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -849,7 +986,8 @@ class SignalTUI(App):
                 yield ChatMessages(id="messages-container")
 
                 with Container(id="input-area"):
-                    yield Input(
+                    yield AttachmentIndicator(id="attachment-indicator")
+                    yield MessageInput(
                         placeholder="Type a message... (Enter to send)",
                         id="message-input"
                     )
@@ -859,17 +997,45 @@ class SignalTUI(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        """Initialize the app on mount."""
-        # Update status bar
+        """Initialize the app on mount - renders UI immediately, loads data async."""
+        # Set phone number from config (fast, no subprocess)
         status_bar = self.query_one("#status-bar", StatusBar)
-        status_bar.version = self.signal_client.get_version()
         status_bar.phone_number = self.config.phone_number
 
         # Check if setup is needed
         if not config_manager.is_configured():
+            status_bar.connecting = False  # Not connecting if going to setup
             self.push_screen(SetupScreen(self.signal_client))
         else:
-            self.reinitialize()
+            # Load contacts from cache immediately for instant display
+            if contact_cache.has_cache():
+                cached_contacts, cached_groups = contact_cache.load()
+                if cached_contacts or cached_groups:
+                    contact_list = self._build_contact_list(cached_contacts, cached_groups, from_cache=True)
+                    self._update_contacts_ui(contact_list)
+            # Run async initialization in background worker
+            self.run_worker(self._async_init(), exclusive=True)
+
+    async def _async_init(self) -> None:
+        """Async initialization - fetches version, verifies account, loads contacts."""
+        status_bar = self.query_one("#status-bar", StatusBar)
+
+        # Get version (runs in thread to not block)
+        version = await asyncio.to_thread(self.signal_client.get_version)
+        status_bar.version = version
+
+        # Verify account connection
+        connected = await asyncio.to_thread(self.signal_client.verify_account)
+        status_bar.connecting = False
+        status_bar.connected = connected
+
+        if connected:
+            # Load contacts in background (will update cache and UI)
+            self.load_contacts()
+            self.start_message_receiver()
+            self.notify("Connected to Signal!", severity="information")
+        else:
+            self.notify("Could not connect to Signal. Check signal-cli configuration.", severity="error")
 
     def reinitialize(self) -> None:
         """Reinitialize the app with current config (called after setup or on refresh)."""
@@ -880,19 +1046,21 @@ class SignalTUI(App):
         # Update signal client with new phone number
         self.signal_client.phone_number = self.config.phone_number
 
-        # Update status bar
+        # Update status bar with loading state
         status_bar = self.query_one("#status-bar", StatusBar)
-        status_bar.version = self.signal_client.get_version()
         status_bar.phone_number = self.config.phone_number
+        status_bar.connecting = True
+        status_bar.version = "..."
 
-        # Verify account and load data
-        status_bar.connected = self.signal_client.verify_account()
-        if status_bar.connected:
-            self.load_contacts()
-            self.start_message_receiver()
-            self.notify("Connected to Signal!", severity="information")
-        else:
-            self.notify("Could not connect to Signal. Check signal-cli configuration.", severity="error")
+        # Load contacts from cache immediately for instant display
+        if contact_cache.has_cache():
+            cached_contacts, cached_groups = contact_cache.load()
+            if cached_contacts or cached_groups:
+                contact_list = self._build_contact_list(cached_contacts, cached_groups, from_cache=True)
+                self._update_contacts_ui(contact_list)
+
+        # Run async initialization in background worker
+        self.run_worker(self._async_init(), exclusive=True)
 
     def load_contacts(self) -> None:
         """Load contacts - from cache first for instant display, then refresh in background."""
@@ -1033,6 +1201,16 @@ class SignalTUI(App):
         # Show notification
         self.notify(f"New message from {msg.display_sender}")
 
+    def on_message_input_image_pasted(self, event: MessageInput.ImagePasted) -> None:
+        """Handle image pasted from clipboard."""
+        # Clean up previous attachment if any
+        if self.staged_attachment:
+            cleanup_temp_attachment(self.staged_attachment)
+
+        self.staged_attachment = event.attachment
+        self.query_one("#attachment-indicator", AttachmentIndicator).set_attachment(event.attachment)
+        self.notify(f"Image staged: {event.attachment.filename}", severity="information")
+
     def on_input_changed(self, event: Input.Changed) -> None:
         """Handle input changes - used for search filtering."""
         if event.input.id == "search-box":
@@ -1041,24 +1219,37 @@ class SignalTUI(App):
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         """Handle message submission."""
-        if event.input.id == "message-input" and event.value.strip():
+        if event.input.id == "message-input":
+            message_text = event.value.strip()
+            has_attachment = self.staged_attachment is not None
+
+            # Need either text or attachment to send
+            if not message_text and not has_attachment:
+                return
+
             if not self.current_contact:
                 self.notify("Select a conversation first", severity="warning")
                 return
 
-            message_text = event.value.strip()
             event.input.value = ""
+
+            # Get attachment path and clear indicator
+            attachment_path = None
+            if self.staged_attachment:
+                attachment_path = self.staged_attachment.path
+                self.staged_attachment = None
+                self.query_one("#attachment-indicator", AttachmentIndicator).set_attachment(None)
 
             # Send message in background thread
             import threading
             thread = threading.Thread(
                 target=self._send_message_thread,
-                args=(message_text,),
+                args=(message_text, attachment_path),
                 daemon=True
             )
             thread.start()
 
-    def _send_message_thread(self, text: str) -> None:
+    def _send_message_thread(self, text: str, attachment_path: Optional[str] = None) -> None:
         """Send a message in a background thread."""
         if not self.current_contact:
             return
@@ -1066,18 +1257,30 @@ class SignalTUI(App):
         # Determine if it's a group (signal-cli uses base64 encoded group IDs)
         is_group = not self.current_contact.startswith("+")
 
+        # Prepare attachments list
+        attachments = [attachment_path] if attachment_path else None
+
         success = self.signal_client.send_message(
             self.current_contact,
             text,
-            group=is_group
+            group=is_group,
+            attachments=attachments
         )
 
         if success:
+            # Build message body for display
+            display_body = text
+            if attachment_path:
+                if text:
+                    display_body = f"[Image] {text}"
+                else:
+                    display_body = "[Image]"
+
             # Add to local conversation
             msg = Message(
                 sender=self.config.phone_number,
                 sender_name="You",
-                body=text,
+                body=display_body,
                 timestamp=datetime.now(),
                 is_outgoing=True
             )
@@ -1088,6 +1291,17 @@ class SignalTUI(App):
 
             # Update UI
             self.call_from_thread(self._add_sent_message, msg)
+
+            # Clean up temp attachment file
+            if attachment_path:
+                import tempfile
+                import os
+                temp_dir = tempfile.gettempdir()
+                if attachment_path.startswith(temp_dir) and os.path.exists(attachment_path):
+                    try:
+                        os.remove(attachment_path)
+                    except Exception:
+                        pass
         else:
             self.call_from_thread(
                 self.notify,
@@ -1103,7 +1317,19 @@ class SignalTUI(App):
     def action_quit(self) -> None:
         """Quit the application."""
         self._running = False  # Signal receive thread to stop
+        # Clean up any staged attachment
+        if self.staged_attachment:
+            cleanup_temp_attachment(self.staged_attachment)
+            self.staged_attachment = None
         self.exit()
+
+    def action_clear_attachment(self) -> None:
+        """Clear the staged attachment."""
+        if self.staged_attachment:
+            cleanup_temp_attachment(self.staged_attachment)
+            self.staged_attachment = None
+            self.query_one("#attachment-indicator", AttachmentIndicator).set_attachment(None)
+            self.notify("Attachment removed", severity="information")
 
     def action_new_chat(self) -> None:
         """Start a new chat."""
@@ -1141,6 +1367,13 @@ class SignalTUI(App):
         """Open a conversation."""
         self.current_contact = contact_id
         self.current_contact_name = name
+        self.current_is_group = is_group
+
+        # Clear any staged attachment when switching conversations
+        if self.staged_attachment:
+            cleanup_temp_attachment(self.staged_attachment)
+            self.staged_attachment = None
+            self.query_one("#attachment-indicator", AttachmentIndicator).set_attachment(None)
 
         # Update header
         self.query_one("#chat-header-name", Static).update(name)
@@ -1171,6 +1404,8 @@ class SignalTUI(App):
             "Ctrl+S: Search\n"
             "Ctrl+R: Refresh\n"
             "Ctrl+L: Link Account\n"
+            "Ctrl+V: Paste Image\n"
+            "Ctrl+X: Clear Attachment\n"
             "Up/Down: Navigate contacts\n"
             "Enter: Select/Send\n"
             "Ctrl+Q: Quit",
