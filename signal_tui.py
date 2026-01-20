@@ -91,21 +91,23 @@ class MessageBubble(Static):
 
     def _render_message(self) -> RenderableType:
         align = "right" if self.is_me else "left"
-        style = "bold cyan" if self.is_me else "bold green"
-        bubble_style = "on rgb(40,80,100)" if self.is_me else "on rgb(50,50,60)"
+        # Softer, Signal-inspired colors
+        name_style = "bold #93c5fd" if self.is_me else "bold #9ca3af"
+        # Sent: Signal blue tint, Received: subtle gray
+        bubble_style = "on #2563b4" if self.is_me else "on #272730"
 
         header = Text()
-        header.append(f"{self.sender}", style=style)
-        header.append(f"  {self.time}", style="dim italic")
+        header.append(f"{self.sender}", style=name_style)
+        header.append(f"  {self.time}", style="dim italic #9ca3af")
 
         content = Text()
-        content.append(self.message)
+        content.append(self.message, style="#f0f0f5")
 
         return Panel(
             content,
             title=header,
             title_align=align,
-            border_style="cyan" if self.is_me else "green",
+            border_style="#3b82f6" if self.is_me else "#373741",
             style=bubble_style,
             padding=(0, 1),
         )
@@ -143,15 +145,15 @@ class ContactItem(Static):
         # Icon and name with unread indicator
         icon = "[G] " if self.is_group else ""
         if self.unread > 0:
-            text.append("● ", style="bold red")
-        text.append(f"{icon}{self.contact_name}\n", style="bold white")
+            text.append("● ", style="bold #3b82f6")
+        text.append(f"{icon}{self.contact_name}\n", style="bold #f0f0f5")
 
         # Last message preview (truncated)
-        preview = self.last_message[:28] + "..." if len(self.last_message) > 28 else self.last_message
-        text.append(f"{preview}\n", style="dim")
+        preview = self.last_message[:30] + "..." if len(self.last_message) > 30 else self.last_message
+        text.append(f"{preview}\n", style="#71717a")
 
         # Time
-        text.append(f"{self.time}", style="dim italic cyan")
+        text.append(f"{self.time}", style="italic #52525b")
 
         return text
 
@@ -166,16 +168,16 @@ class StatusBar(Static):
     def render(self) -> RenderableType:
         text = Text()
         if self.connected:
-            text.append("● ", style="bold green")
-            text.append("Connected", style="green")
+            text.append("● ", style="bold #22c55e")
+            text.append("Connected", style="#22c55e")
         else:
-            text.append("○ ", style="bold red")
-            text.append("Disconnected", style="red")
-        text.append(" │ ", style="dim")
-        text.append(f"{self.version}", style="dim")
+            text.append("○ ", style="bold #ef4444")
+            text.append("Disconnected", style="#ef4444")
+        text.append(" │ ", style="#3f3f46")
+        text.append(f"{self.version}", style="#71717a")
         if self.phone_number:
-            text.append(" │ ", style="dim")
-            text.append(f"Linked to: {self.phone_number}", style="dim cyan")
+            text.append(" │ ", style="#3f3f46")
+            text.append(f"Linked to: {self.phone_number}", style="#3b82f6")
         return text
 
 
@@ -187,39 +189,41 @@ class SetupScreen(Screen):
     """Initial setup screen for linking signal-cli."""
 
     CSS = """
+    /* Setup Screen - Signal-Inspired Theme */
     SetupScreen {
         align: center middle;
-        background: rgb(20, 20, 30);
+        background: rgb(17, 17, 20);
     }
 
     #setup-container {
         width: 70;
         height: auto;
-        background: rgb(30, 35, 45);
-        border: round rgb(80, 100, 140);
+        background: rgb(24, 24, 30);
+        border: round rgb(45, 45, 55);
         padding: 2 4;
     }
 
     #setup-title {
         text-align: center;
         text-style: bold;
-        color: rgb(100, 180, 255);
+        color: rgb(59, 130, 246);
         margin-bottom: 1;
     }
 
     #setup-subtitle {
         text-align: center;
-        color: rgb(150, 150, 170);
+        color: rgb(113, 113, 122);
         margin-bottom: 2;
     }
 
     .setup-section {
         margin: 1 0;
+        color: rgb(156, 163, 175);
     }
 
     .section-header {
         text-style: bold;
-        color: rgb(100, 200, 100);
+        color: rgb(59, 130, 246);
         margin-bottom: 1;
     }
 
@@ -245,7 +249,7 @@ class SetupScreen(Screen):
     }
 
     #link-uri {
-        background: rgb(40, 45, 55);
+        background: rgb(32, 32, 40);
         padding: 1;
         margin: 1 0;
         max-height: 4;
@@ -263,13 +267,13 @@ class SetupScreen(Screen):
     }
 
     #error-text {
-        color: rgb(255, 100, 100);
+        color: rgb(239, 68, 68);
         text-align: center;
         margin: 1 0;
     }
 
     #success-text {
-        color: rgb(100, 255, 100);
+        color: rgb(34, 197, 94);
         text-align: center;
         margin: 1 0;
     }
@@ -277,12 +281,16 @@ class SetupScreen(Screen):
     #existing-accounts {
         margin: 1 0;
         padding: 1;
-        background: rgb(40, 45, 55);
-        border: round rgb(60, 70, 80);
+        background: rgb(32, 32, 40);
+        border: round rgb(45, 45, 55);
     }
 
     .account-button {
         margin: 0 1;
+    }
+
+    Rule {
+        color: rgb(45, 45, 55);
     }
     """
 
@@ -626,130 +634,155 @@ class SignalTUI(App):
     """A terminal user interface for signal-cli."""
 
     CSS = """
+    /* Signal-Inspired Modern Dark Theme */
+    /* Base: rgb(17, 17, 20) - Darkest */
+    /* Surface: rgb(24, 24, 30) - Sidebar */
+    /* Elevated: rgb(32, 32, 40) - Cards, inputs */
+    /* Hover: rgb(40, 40, 50) - Hover states */
+    /* Primary: rgb(59, 130, 246) - Signal blue */
+
     Screen {
-        background: $surface;
+        background: rgb(17, 17, 20);
     }
 
     #main-container {
         height: 100%;
     }
 
+    /* Sidebar - Clean, minimal */
     #sidebar {
-        width: 35;
-        background: rgb(25, 25, 35);
-        border-right: solid rgb(60, 60, 80);
+        width: 36;
+        background: rgb(24, 24, 30);
+        border-right: solid rgb(38, 38, 46);
         padding: 0;
     }
 
     #sidebar-header {
         height: 3;
-        background: rgb(30, 30, 45);
+        background: rgb(24, 24, 30);
         padding: 1;
         text-align: center;
+        border-bottom: solid rgb(38, 38, 46);
     }
 
     #search-box {
         margin: 1;
-        background: rgb(40, 40, 55);
-        border: round rgb(80, 80, 100);
+        background: rgb(32, 32, 40);
+        border: tall rgb(45, 45, 55);
+        padding: 0 1;
+    }
+
+    #search-box:focus {
+        border: tall rgb(59, 130, 246);
     }
 
     #contacts-list {
         height: 1fr;
-        padding: 0 1;
+        padding: 0;
     }
 
+    /* Contact Items - Borderless cards with accent selection */
     .contact-item {
         height: auto;
-        padding: 1;
-        margin-bottom: 1;
-        background: rgb(35, 35, 50);
-        border: round rgb(50, 50, 70);
+        padding: 1 2;
+        margin: 0;
+        background: transparent;
+        border: none;
+        border-left: wide transparent;
     }
 
     .contact-item.selected {
-        background: rgb(50, 70, 90);
-        border: round rgb(100, 150, 200);
+        background: rgba(59, 130, 246, 0.15);
+        border-left: wide rgb(59, 130, 246);
     }
 
     .contact-item:hover {
-        background: rgb(45, 55, 70);
+        background: rgba(255, 255, 255, 0.04);
     }
 
+    /* Chat Area */
     #chat-area {
         height: 100%;
+        background: rgb(17, 17, 20);
     }
 
     #chat-header {
         height: 3;
-        background: rgb(30, 40, 50);
-        padding: 1;
-        border-bottom: solid rgb(60, 80, 100);
+        background: rgb(24, 24, 30);
+        padding: 1 2;
+        border-bottom: solid rgb(38, 38, 46);
     }
 
     #chat-header-name {
         text-style: bold;
+        color: rgb(240, 240, 245);
     }
 
     #chat-header-status {
-        color: rgb(100, 200, 100);
+        color: rgb(59, 130, 246);
         text-style: italic;
+        margin-left: 2;
     }
 
     #messages-container {
         height: 1fr;
         padding: 1 2;
-        background: rgb(20, 20, 30);
+        background: rgb(17, 17, 20);
     }
 
     .date-divider {
         text-align: center;
-        color: rgb(100, 100, 120);
+        color: rgb(113, 113, 122);
         margin: 1 0;
     }
 
     .centered-text {
         text-align: center;
-        color: rgb(100, 100, 120);
+        color: rgb(113, 113, 122);
         margin: 2;
     }
 
     MessageBubble {
-        margin: 1 0;
+        margin: 0 0 1 0;
         width: 100%;
     }
 
+    /* Input Area - Clean and minimal */
     #input-area {
         height: auto;
         min-height: 3;
-        background: rgb(30, 35, 45);
+        background: rgb(24, 24, 30);
         padding: 1;
-        border-top: solid rgb(60, 80, 100);
+        border-top: solid rgb(38, 38, 46);
     }
 
     #message-input {
-        background: rgb(45, 50, 65);
-        border: round rgb(80, 100, 140);
+        background: rgb(32, 32, 40);
+        border: tall rgb(45, 45, 55);
         padding: 0 1;
     }
 
     #message-input:focus {
-        border: round rgb(100, 150, 255);
+        border: tall rgb(59, 130, 246);
     }
 
+    /* Status Bar - Compact, subtle */
     #status-bar {
         height: 1;
-        background: rgb(25, 30, 40);
+        background: rgb(20, 20, 26);
         padding: 0 1;
+        border-top: solid rgb(32, 32, 40);
     }
 
     #app-title {
-        color: rgb(100, 180, 255);
+        color: rgb(59, 130, 246);
         text-style: bold;
     }
 
+    /* Footer - Match theme */
     Footer {
-        background: rgb(20, 25, 35);
+        background: rgb(20, 20, 26);
+        color: rgb(113, 113, 122);
     }
 
     LoadingIndicator {
@@ -758,7 +791,7 @@ class SignalTUI(App):
 
     .no-results {
         text-align: center;
-        color: rgb(150, 150, 170);
+        color: rgb(113, 113, 122);
         padding: 2;
         text-style: italic;
     }
@@ -801,7 +834,7 @@ class SignalTUI(App):
             # Sidebar
             with Vertical(id="sidebar"):
                 yield Static(
-                    Text("SIGNAL", style="bold rgb(100,180,255)"),
+                    Text("SIGNAL", style="bold rgb(59, 130, 246)"),
                     id="sidebar-header"
                 )
                 yield Input(placeholder="Search...", id="search-box")
