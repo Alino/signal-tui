@@ -1,0 +1,18 @@
+[project]
+name = "signal-tui"
+version = "0.1.0"
+description = "A terminal user interface for signal-cli"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "textual>=0.47.0",
+    "rich>=13.7.0",
+    "qrcode>=7.4.0",
+]
+
+[project.scripts]
+signal-tui = "signal_tui:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
