@@ -4,6 +4,7 @@ Signal TUI - A terminal user interface for signal-cli
 """
 
 import asyncio
+import threading
 from datetime import datetime
 from typing import Optional
 from textual.app import App, ComposeResult
@@ -21,9 +22,12 @@ from rich.panel import Panel
 from rich.console import RenderableType
 from rich.align import Align
 
-from config import config_manager, Config, contact_cache
+from pathlib import Path
+
+from config import config_manager, Config
 from signal_client import SignalClient, AsyncSignalClient, Message, Contact, SignalCliNotFoundError
 from clipboard import grab_clipboard_image, cleanup_temp_attachment, is_clipboard_supported, StagedAttachment
+from message_store import MessageStore
 
 # QR Code generation
 try:
@@ -171,7 +175,13 @@ class MessageBubble(Static):
 
         # Then show message text
         if self.message:
-            content.append(self.message, style="#f0f0f5")
+            msg_text = Text(self.message, style="#f0f0f5")
+            # Highlight URLs with regex pattern
+            msg_text.highlight_regex(
+                r"https?://[^\s<>\"']+",
+                style="underline #60a5fa"
+            )
+            content.append(msg_text)
 
         return Panel(
             content,
@@ -208,6 +218,11 @@ class ContactItem(Static):
     def on_click(self) -> None:
         """Handle click on contact."""
         self.app.open_conversation(self.contact_id, self.contact_name, self.is_group)
+
+    def on_key(self, event) -> None:
+        """Handle key press on focused contact."""
+        if event.key == "enter":
+            self.app.open_conversation(self.contact_id, self.contact_name, self.is_group)
 
     def render(self) -> RenderableType:
         text = Text()
@@ -656,7 +671,7 @@ class ContactsList(ScrollableContainer):
             item.remove()
 
         # Add filtered contacts
-        for i, (cid, name, msg, time, unread, is_group) in enumerate(self.filtered_contacts):
+        for i, (cid, name, msg, time, unread, is_group, _) in enumerate(self.filtered_contacts):
             contact = ContactItem(cid, name, msg, time, unread, is_group)
             contact.add_class("contact-item")
             if i == 0:
@@ -673,6 +688,7 @@ class ContactsList(ScrollableContainer):
                     contact.add_class("selected")
             self.selected_index = index
             self.scroll_to_widget(contacts[index])
+            contacts[index].focus()
 
     def get_selected_contact(self) -> Optional[tuple]:
         """Get the currently selected contact."""
@@ -684,27 +700,34 @@ class ContactsList(ScrollableContainer):
 class ChatMessages(ScrollableContainer):
     """Container for chat messages."""
 
+    MAX_MESSAGES = 100  # Limit displayed messages
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.messages: list[Message] = []
+        self.conversation_id: Optional[str] = None
 
     def compose(self) -> ComposeResult:
         yield Static("Select a conversation to start chatting", classes="centered-text empty-chat-message")
 
-    def set_messages(self, messages: list[Message]) -> None:
-        """Update displayed messages."""
-        self.messages = messages
+    def set_messages(self, messages: list[Message], conversation_id: Optional[str] = None) -> None:
+        """Update displayed messages (limited to most recent MAX_MESSAGES)."""
+        # Only show the most recent messages
+        display_messages = messages[-self.MAX_MESSAGES:] if len(messages) > self.MAX_MESSAGES else messages
+        self.messages = display_messages
+        self.conversation_id = conversation_id
 
         # Clear existing
         self.query("*").remove()
 
-        if not messages:
+        if not display_messages:
             self.mount(Static("No messages yet. Send one!", classes="centered-text empty-chat-message"))
             return
 
-        # Group by date
+        # Build all widgets first for batch mounting
+        widgets = []
         current_date = None
-        for msg in messages:
+        for msg in display_messages:
             msg_date = msg.timestamp.date()
             if msg_date != current_date:
                 current_date = msg_date
@@ -712,7 +735,7 @@ class ChatMessages(ScrollableContainer):
                     date_str = "Today"
                 else:
                     date_str = msg_date.strftime("%B %d, %Y")
-                self.mount(Static(f"─── {date_str} ───", classes="date-divider"))
+                widgets.append(Static(f"─── {date_str} ───", classes="date-divider"))
 
             bubble = MessageBubble(
                 msg.display_sender,
@@ -721,10 +744,13 @@ class ChatMessages(ScrollableContainer):
                 msg.is_outgoing,
                 msg.attachments
             )
-            self.mount(bubble)
+            widgets.append(bubble)
 
-        # Scroll to bottom
-        self.scroll_end(animate=False)
+        # Mount all widgets at once for better performance
+        self.mount_all(widgets)
+
+        # Scroll to bottom after layout completes
+        self.set_timer(0.1, lambda: self.scroll_end(animate=False))
 
     def add_message(self, msg: Message) -> None:
         """Add a single new message."""
@@ -740,7 +766,9 @@ class ChatMessages(ScrollableContainer):
             msg.attachments
         )
         self.mount(bubble)
-        self.scroll_end(animate=False)
+
+        # Scroll to bottom after layout completes
+        self.call_after_refresh(lambda: self.scroll_end(animate=False))
 
 
 # ============================================================================
@@ -906,6 +934,7 @@ class SignalTUI(App):
         background: transparent;
     }
 
+
     .no-results {
         text-align: center;
         color: rgb(113, 113, 122);
@@ -961,8 +990,12 @@ class SignalTUI(App):
         self.current_contact_name: str = ""
         self.current_is_group: bool = False
         self.conversations: dict[str, list[Message]] = {}
+        self.last_message_times: dict[str, datetime] = {}
         self._receive_task: Optional[asyncio.Task] = None
         self.staged_attachment: Optional[StagedAttachment] = None
+
+        # Initialize message store for persistence
+        self.message_store = MessageStore(Path(self.config.messages_db_path))
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -1008,8 +1041,9 @@ class SignalTUI(App):
             self.push_screen(SetupScreen(self.signal_client))
         else:
             # Load contacts from cache immediately for instant display
-            if contact_cache.has_cache():
-                cached_contacts, cached_groups = contact_cache.load()
+            if self.message_store.has_contact_cache():
+                cached_contacts = self.message_store.get_contacts()
+                cached_groups = self.message_store.get_groups()
                 if cached_contacts or cached_groups:
                     contact_list = self._build_contact_list(cached_contacts, cached_groups, from_cache=True)
                     self._update_contacts_ui(contact_list)
@@ -1034,6 +1068,8 @@ class SignalTUI(App):
             self.load_contacts()
             self.start_message_receiver()
             self.notify("Connected to Signal!", severity="information")
+            # Start auto-import from Signal Desktop after a short delay
+            self.set_timer(1.0, self._start_auto_import)
         else:
             self.notify("Could not connect to Signal. Check signal-cli configuration.", severity="error")
 
@@ -1053,8 +1089,9 @@ class SignalTUI(App):
         status_bar.version = "..."
 
         # Load contacts from cache immediately for instant display
-        if contact_cache.has_cache():
-            cached_contacts, cached_groups = contact_cache.load()
+        if self.message_store.has_contact_cache():
+            cached_contacts = self.message_store.get_contacts()
+            cached_groups = self.message_store.get_groups()
             if cached_contacts or cached_groups:
                 contact_list = self._build_contact_list(cached_contacts, cached_groups, from_cache=True)
                 self._update_contacts_ui(contact_list)
@@ -1065,8 +1102,9 @@ class SignalTUI(App):
     def load_contacts(self) -> None:
         """Load contacts - from cache first for instant display, then refresh in background."""
         # First, try to load from cache for instant display
-        if contact_cache.has_cache():
-            cached_contacts, cached_groups = contact_cache.load()
+        if self.message_store.has_contact_cache():
+            cached_contacts = self.message_store.get_contacts()
+            cached_groups = self.message_store.get_groups()
             if cached_contacts or cached_groups:
                 contact_list = self._build_contact_list(cached_contacts, cached_groups, from_cache=True)
                 self._update_contacts_ui(contact_list)
@@ -1080,6 +1118,9 @@ class SignalTUI(App):
         """Build contact list for UI from contacts and groups data."""
         contact_list = []
 
+        # Get stored conversations from message store for last message/unread info
+        stored_convs = {c.id: c for c in self.message_store.get_all_conversations()}
+
         if from_cache:
             # Contacts from cache are raw dicts
             for item in contacts:
@@ -1092,37 +1133,94 @@ class SignalTUI(App):
                         profile_name = profile.get("givenName") or ""
                 display_name = name or profile_name or number or "Unknown"
 
+                # Get stored conversation info
+                stored = stored_convs.get(number)
+                last_msg = stored.last_message if stored else ""
+                last_time = ""
+                unread = stored.unread_count if stored else 0
+                if stored and stored.last_message_at:
+                    last_dt = datetime.fromtimestamp(stored.last_message_at / 1000)
+                    self.last_message_times[number] = last_dt
+                    if last_dt.date() == datetime.now().date():
+                        last_time = last_dt.strftime("%I:%M %p")
+                    else:
+                        last_time = last_dt.strftime("%b %d")
+
                 contact_list.append((
                     number,
                     display_name,
-                    "",  # Last message
-                    "",  # Time
-                    0,   # Unread count
-                    False  # Not a group
+                    last_msg,
+                    last_time,
+                    unread,
+                    False,  # Not a group
+                    stored.last_message_at if stored else 0  # Raw timestamp for sorting
                 ))
         else:
             # Contacts from signal_client are Contact objects
             for contact in contacts:
+                number = contact.number or ""
+                stored = stored_convs.get(number)
+                last_msg = stored.last_message if stored else ""
+                last_time = ""
+                unread = stored.unread_count if stored else 0
+                if stored and stored.last_message_at:
+                    last_dt = datetime.fromtimestamp(stored.last_message_at / 1000)
+                    self.last_message_times[number] = last_dt
+                    if last_dt.date() == datetime.now().date():
+                        last_time = last_dt.strftime("%I:%M %p")
+                    else:
+                        last_time = last_dt.strftime("%b %d")
+
                 contact_list.append((
-                    contact.number or "",
+                    number,
                     contact.display_name or "Unknown",
-                    "",  # Last message
-                    "",  # Time
-                    0,   # Unread count
-                    False  # Not a group
+                    last_msg,
+                    last_time,
+                    unread,
+                    False,  # Not a group
+                    stored.last_message_at if stored else 0  # Raw timestamp for sorting
                 ))
 
         for group in groups:
             group_id = group.get("id", "")
             group_name = group.get("name", "Unknown Group")
+
+            stored = stored_convs.get(group_id)
+            last_msg = stored.last_message if stored else ""
+            last_time = ""
+            unread = stored.unread_count if stored else 0
+            if stored and stored.last_message_at:
+                last_dt = datetime.fromtimestamp(stored.last_message_at / 1000)
+                self.last_message_times[group_id] = last_dt
+                if last_dt.date() == datetime.now().date():
+                    last_time = last_dt.strftime("%I:%M %p")
+                else:
+                    last_time = last_dt.strftime("%b %d")
+
             contact_list.append((
                 group_id,
                 group_name,
-                "",
-                "",
-                0,
-                True  # Is a group
+                last_msg,
+                last_time,
+                unread,
+                True,  # Is a group
+                stored.last_message_at if stored else 0  # Raw timestamp for sorting
             ))
+
+        # Sort contacts by last message time (most recent first)
+        # Contacts with messages appear first, sorted by timestamp descending
+        # Contacts without messages appear at the end, sorted alphabetically
+        def sort_key(contact):
+            name = contact[1]
+            last_timestamp = contact[6]  # Raw timestamp in ms, or 0
+            if last_timestamp:
+                # Has messages: sort by timestamp descending (negate for descending)
+                return (0, -last_timestamp, name.lower())
+            else:
+                # No messages: sort alphabetically at the end
+                return (1, 0, name.lower())
+
+        contact_list.sort(key=sort_key)
 
         return contact_list
 
@@ -1143,8 +1241,9 @@ class SignalTUI(App):
                     "isBlocked": contact.is_blocked,
                 })
 
-            # Save to cache
-            contact_cache.save(contacts_for_cache, groups)
+            # Save to encrypted database cache
+            self.message_store.save_contacts(contacts_for_cache)
+            self.message_store.save_groups(groups)
 
             # Build contact list for UI
             contact_list = self._build_contact_list(contacts, groups, from_cache=False)
@@ -1163,6 +1262,15 @@ class SignalTUI(App):
         # Update status
         status = self.query_one("#status-bar", StatusBar)
         status.connected = True
+
+    def _resort_contacts(self) -> None:
+        """Re-sort the contact list based on last message times."""
+        if self.message_store.has_contact_cache():
+            cached_contacts = self.message_store.get_contacts()
+            cached_groups = self.message_store.get_groups()
+            if cached_contacts or cached_groups:
+                contact_list = self._build_contact_list(cached_contacts, cached_groups, from_cache=True)
+                self._update_contacts_ui(contact_list)
 
     def start_message_receiver(self) -> None:
         """Start background message receiver thread."""
@@ -1193,6 +1301,15 @@ class SignalTUI(App):
             self.conversations[contact_id] = []
         self.conversations[contact_id].append(msg)
 
+        # Track last message time for sorting
+        self.last_message_times[contact_id] = msg.timestamp
+
+        # Persist message to database
+        self.message_store.save_message(msg, contact_id)
+
+        # Re-sort contact list to move this contact to top
+        self._resort_contacts()
+
         # If this is the current conversation, update UI
         if contact_id == self.current_contact:
             messages_container = self.query_one("#messages-container", ChatMessages)
@@ -1222,6 +1339,12 @@ class SignalTUI(App):
         if event.input.id == "message-input":
             message_text = event.value.strip()
             has_attachment = self.staged_attachment is not None
+
+            # Check for commands
+            if message_text.startswith("/"):
+                event.input.value = ""
+                self._handle_command(message_text)
+                return
 
             # Need either text or attachment to send
             if not message_text and not has_attachment:
@@ -1289,8 +1412,15 @@ class SignalTUI(App):
                 self.conversations[self.current_contact] = []
             self.conversations[self.current_contact].append(msg)
 
-            # Update UI
+            # Track last message time for sorting
+            self.last_message_times[self.current_contact] = msg.timestamp
+
+            # Persist message to database
+            self.message_store.save_message(msg, self.current_contact)
+
+            # Update UI and re-sort contacts
             self.call_from_thread(self._add_sent_message, msg)
+            self.call_from_thread(self._resort_contacts)
 
             # Clean up temp attachment file
             if attachment_path:
@@ -1321,6 +1451,8 @@ class SignalTUI(App):
         if self.staged_attachment:
             cleanup_temp_attachment(self.staged_attachment)
             self.staged_attachment = None
+        # Close message store
+        self.message_store.close()
         self.exit()
 
     def action_clear_attachment(self) -> None:
@@ -1375,18 +1507,77 @@ class SignalTUI(App):
             self.staged_attachment = None
             self.query_one("#attachment-indicator", AttachmentIndicator).set_attachment(None)
 
-        # Update header
+        # Update header immediately
         self.query_one("#chat-header-name", Static).update(name)
         status = "group" if is_group else "direct message"
         self.query_one("#chat-header-status", Static).update(f"● {status}")
 
-        # Load messages for this conversation
-        messages = self.conversations.get(contact_id, [])
+        # Clear messages and show loading state
         messages_container = self.query_one("#messages-container", ChatMessages)
-        messages_container.set_messages(messages)
+        messages_container.set_messages([], conversation_id=contact_id)
 
-        # Focus input
+        # Focus input immediately
         self.query_one("#message-input", Input).focus()
+
+        # Load messages in background thread to avoid blocking UI
+        threading.Thread(
+            target=self._load_conversation_messages,
+            args=(contact_id,),
+            daemon=True
+        ).start()
+
+    def _load_conversation_messages(self, contact_id: str) -> None:
+        """Load conversation messages in background thread."""
+        # Load messages from database
+        db_messages = self.message_store.get_messages(contact_id, limit=100)
+
+        # Update sender names for database messages
+        for msg in db_messages:
+            if msg.is_outgoing:
+                msg.sender_name = "You"
+            elif not msg.sender_name and msg.sender:
+                msg.sender_name = self.signal_client.get_contact_name(msg.sender)
+
+        # Mark messages as read in database
+        self.message_store.mark_messages_read(contact_id)
+
+        # Update UI from main thread
+        self.call_from_thread(self._finish_open_conversation, contact_id, db_messages)
+
+    def _finish_open_conversation(self, contact_id: str, db_messages: list[Message]) -> None:
+        """Finish opening conversation on main thread."""
+        # Verify we're still on the same conversation
+        if contact_id != self.current_contact:
+            return
+
+        # Merge with any in-memory messages (newer ones not yet in DB)
+        in_memory = self.conversations.get(contact_id, [])
+
+        # Use a set to track unique messages by timestamp + sender + body
+        seen = set()
+        merged = []
+
+        for msg in db_messages:
+            key = (int(msg.timestamp.timestamp()), msg.sender, msg.body)
+            if key not in seen:
+                seen.add(key)
+                merged.append(msg)
+
+        for msg in in_memory:
+            key = (int(msg.timestamp.timestamp()), msg.sender, msg.body)
+            if key not in seen:
+                seen.add(key)
+                merged.append(msg)
+
+        # Sort by timestamp
+        merged.sort(key=lambda m: m.timestamp)
+
+        # Update in-memory cache
+        self.conversations[contact_id] = merged
+
+        # Update UI
+        messages_container = self.query_one("#messages-container", ChatMessages)
+        messages_container.set_messages(merged, conversation_id=contact_id)
 
     def action_refresh(self) -> None:
         """Refresh contacts and messages."""
@@ -1396,6 +1587,137 @@ class SignalTUI(App):
     def action_setup(self) -> None:
         """Open setup screen."""
         self.push_screen(SetupScreen(self.signal_client))
+
+    def _handle_command(self, command: str) -> None:
+        """Handle slash commands."""
+        parts = command.split(maxsplit=1)
+        cmd = parts[0].lower()
+
+        if cmd == "/import":
+            self._start_desktop_import()
+        elif cmd == "/stats":
+            self._show_stats()
+        elif cmd == "/help":
+            self.action_show_help()
+        else:
+            self.notify(
+                f"Unknown command: {cmd}\n"
+                "Available: /import, /stats, /help",
+                severity="warning"
+            )
+
+    def _start_desktop_import(self) -> None:
+        """Start importing messages from Signal Desktop."""
+        self.notify("Starting Signal Desktop import...", severity="information")
+
+        # Run import in background thread
+        import threading
+        thread = threading.Thread(target=self._do_desktop_import, daemon=True)
+        thread.start()
+
+    def _do_desktop_import(self, silent: bool = False) -> None:
+        """Background thread to import from Signal Desktop.
+
+        Args:
+            silent: If True, skip progress notifications and only notify if new messages found.
+        """
+        try:
+            from desktop_import import SignalDesktopImporter, DesktopImportError
+
+            importer = SignalDesktopImporter(
+                self.message_store,
+                self.config.phone_number
+            )
+
+            # Check if Signal Desktop is installed
+            if not importer.is_desktop_installed():
+                if not silent:
+                    self.call_from_thread(
+                        self.notify,
+                        "Signal Desktop not found. Please install it first.",
+                        severity="error"
+                    )
+                return
+
+            # Progress callback (only used in non-silent mode)
+            def progress(conv_name: str, current: int, total: int) -> None:
+                if not silent and (current % 10 == 0 or current == total):
+                    self.call_from_thread(
+                        self.notify,
+                        f"Importing: {current}/{total} conversations",
+                        severity="information"
+                    )
+
+            # Run import
+            convs, msgs = importer.import_all(progress_callback=progress)
+            importer.disconnect()
+
+            # Notify completion (silent mode only notifies if new messages found)
+            if silent:
+                if msgs > 0:
+                    self.call_from_thread(
+                        self.notify,
+                        f"Imported {msgs} messages from Signal Desktop",
+                        severity="information",
+                        timeout=5
+                    )
+            else:
+                self.call_from_thread(
+                    self.notify,
+                    f"Import complete: {convs} conversations, {msgs} messages",
+                    severity="information",
+                    timeout=10
+                )
+
+            # Refresh contacts to show updated last messages
+            if msgs > 0:
+                self.call_from_thread(self.load_contacts)
+
+        except Exception as e:
+            error_msg = str(e)
+            if "sqlcipher" in error_msg.lower() or "pysqlcipher" in error_msg.lower() or "no module named" in error_msg.lower():
+                error_msg = "pysqlcipher3 not installed. Run: pip install -e ."
+            if not silent:
+                self.call_from_thread(
+                    self.notify,
+                    f"Import failed: {error_msg}",
+                    severity="error",
+                    timeout=10
+                )
+
+    def _start_auto_import(self) -> None:
+        """Start auto-import from Signal Desktop if enabled."""
+        if not self.config.auto_import_enabled:
+            return
+
+        try:
+            from desktop_import import SignalDesktopImporter
+            # Check if Signal Desktop database exists (class attribute)
+            if not SignalDesktopImporter.DB_PATH.exists():
+                return
+        except ImportError:
+            return
+
+        # Run import in background thread (silent mode)
+        import threading
+        thread = threading.Thread(
+            target=self._do_desktop_import,
+            args=(True,),  # silent=True
+            daemon=True
+        )
+        thread.start()
+
+    def _show_stats(self) -> None:
+        """Show message store statistics."""
+        msg_count = self.message_store.get_message_count()
+        conv_count = self.message_store.get_conversation_count()
+        self.notify(
+            f"Messages: {msg_count}\n"
+            f"Conversations: {conv_count}\n"
+            f"Database: {self.config.messages_db_path}",
+            title="Message Store Stats",
+            timeout=10
+        )
 
     def action_show_help(self) -> None:
         """Show help."""
@@ -1408,7 +1730,9 @@ class SignalTUI(App):
             "Ctrl+X: Clear Attachment\n"
             "Up/Down: Navigate contacts\n"
             "Enter: Select/Send\n"
-            "Ctrl+Q: Quit",
+            "Ctrl+Q: Quit\n"
+            "\n"
+            "Commands: /import, /stats, /help",
             title="Keyboard Shortcuts",
             timeout=10
         )

@@ -269,7 +269,7 @@ class SignalClient:
         except SignalCliError:
             return []
 
-    def send_message(self, recipient: str, message: str, group: bool = False) -> bool:
+    def send_message(self, recipient: str, message: str, group: bool = False, attachments: list[str] = None) -> bool:
         """
         Send a message to a contact or group.
 
@@ -277,9 +277,20 @@ class SignalClient:
             recipient: Phone number or group ID
             message: Message text
             group: If True, recipient is a group ID
+            attachments: List of file paths to attach
         """
         try:
-            args = ["send", "-m", message]
+            args = ["send"]
+
+            # Add message if provided (can be empty when sending only attachments)
+            if message:
+                args.extend(["-m", message])
+
+            # Add attachments
+            if attachments:
+                for attachment_path in attachments:
+                    args.extend(["-a", attachment_path])
+
             if group:
                 args.extend(["-g", recipient])
             else:
@@ -314,6 +325,18 @@ class SignalClient:
                 sender = envelope.get("source", "")
                 timestamp_ms = envelope.get("timestamp", 0)
 
+                # Parse attachments
+                attachments = []
+                for att in data_message.get("attachments", []):
+                    attachments.append({
+                        "id": att.get("id", ""),
+                        "contentType": att.get("contentType", ""),
+                        "filename": att.get("filename", ""),
+                        "size": att.get("size", 0),
+                        "width": att.get("width", 0),
+                        "height": att.get("height", 0),
+                    })
+
                 message = Message(
                     sender=sender,
                     sender_name=self._contacts.get(sender, Contact(sender)).display_name,
@@ -321,12 +344,26 @@ class SignalClient:
                     timestamp=datetime.fromtimestamp(timestamp_ms / 1000) if timestamp_ms else datetime.now(),
                     is_outgoing=False,
                     group_id=data_message.get("groupInfo", {}).get("groupId", ""),
+                    attachments=attachments,
                 )
                 messages.append(message)
 
             return messages
         except SignalCliError:
             return []
+
+    def get_attachment_path(self, attachment_id: str) -> Optional[str]:
+        """Get the local file path for a downloaded attachment."""
+        # signal-cli stores attachments in config_dir/attachments/
+        attachments_dir = Path(self.config_dir) / "attachments"
+        if not attachments_dir.exists():
+            return None
+
+        # Look for the attachment file
+        for f in attachments_dir.iterdir():
+            if attachment_id in f.name:
+                return str(f)
+        return None
 
     def start_receive_daemon(self, callback: Callable[[Message], None]) -> None:
         """
@@ -405,10 +442,13 @@ class AsyncSignalClient:
     def __init__(self, client: SignalClient):
         self.client = client
 
-    async def send_message(self, recipient: str, message: str, group: bool = False) -> bool:
+    async def send_message(self, recipient: str, message: str, group: bool = False, attachments: list[str] = None) -> bool:
         """Send a message asynchronously."""
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self.client.send_message, recipient, message, group)
+        return await loop.run_in_executor(
+            None,
+            lambda: self.client.send_message(recipient, message, group, attachments)
+        )
 
     async def receive_messages(self, timeout: int = 5) -> list[Message]:
         """Receive messages asynchronously."""

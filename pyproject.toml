@@ -8,7 +8,12 @@ dependencies = [
     "textual>=0.47.0",
     "rich>=13.7.0",
     "qrcode>=7.4.0",
+    "Pillow>=10.0.0",
+    "pysqlcipher3>=1.2.0",  # Encrypted message storage (requires: brew install sqlcipher)
 ]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0.0"]
 
 [project.scripts]
 signal-tui = "signal_tui:main"

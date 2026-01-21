@@ -29,10 +29,20 @@ class Config:
     use_daemon: bool = True
     daemon_port: int = 7583
 
+    # Message storage
+    messages_db_path: str = ""  # Default: ~/.config/signal-tui/messages.db
+
+    # Auto-import from Signal Desktop on startup
+    auto_import_enabled: bool = True
+
     def __post_init__(self):
         if not self.signal_cli_config_dir:
             self.signal_cli_config_dir = str(
                 Path.home() / ".local" / "share" / "signal-cli"
+            )
+        if not self.messages_db_path:
+            self.messages_db_path = str(
+                Path.home() / ".config" / "signal-tui" / "messages.db"
             )
 
 
@@ -78,60 +88,5 @@ class ConfigManager:
         self.save()
 
 
-class ContactCache:
-    """Cache for contacts and groups to speed up app startup."""
-
-    CACHE_FILE = ConfigManager.CONFIG_DIR / "contacts_cache.json"
-
-    def __init__(self):
-        self._contacts: list[dict] = []
-        self._groups: list[dict] = []
-        self._last_updated: str = ""
-
-    def load(self) -> tuple[list[dict], list[dict]]:
-        """Load contacts and groups from cache."""
-        if self.CACHE_FILE.exists():
-            try:
-                with open(self.CACHE_FILE, "r") as f:
-                    data = json.load(f)
-                    self._contacts = data.get("contacts", [])
-                    self._groups = data.get("groups", [])
-                    self._last_updated = data.get("last_updated", "")
-                    return self._contacts, self._groups
-            except (json.JSONDecodeError, TypeError):
-                pass
-        return [], []
-
-    def save(self, contacts: list[dict], groups: list[dict]) -> None:
-        """Save contacts and groups to cache."""
-        from datetime import datetime
-        self._contacts = contacts
-        self._groups = groups
-        self._last_updated = datetime.now().isoformat()
-
-        # Ensure directory exists
-        self.CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-        with open(self.CACHE_FILE, "w") as f:
-            json.dump({
-                "contacts": contacts,
-                "groups": groups,
-                "last_updated": self._last_updated
-            }, f)
-
-    def has_cache(self) -> bool:
-        """Check if cache exists."""
-        return self.CACHE_FILE.exists()
-
-    @property
-    def contacts(self) -> list[dict]:
-        return self._contacts
-
-    @property
-    def groups(self) -> list[dict]:
-        return self._groups
-
-
-# Global instances
+# Global instance
 config_manager = ConfigManager()
-contact_cache = ContactCache()
